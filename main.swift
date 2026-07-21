@@ -17,9 +17,137 @@ struct AgentSession {
     var parentID: String?
     var nickname: String?
     var children: [AgentSession] = []
-    var isRunning: Bool { Date().timeIntervalSince(lastModified) < 20 }
-    var anyRunning: Bool { isRunning || children.contains { $0.isRunning } }
+    var isLive: Bool = false  // process alive (from discovery, never mtime)
+    // hybrid: busy = alive AND writing; quiet-while-alive is idle, not done
+    var isBusy: Bool { isLive && Date().timeIntervalSince(lastModified) < 30 }
+    var anyLive: Bool { isLive || children.contains { $0.isLive } }
+    var anyBusy: Bool { isBusy || children.contains { $0.isBusy } }
     var effectiveLastModified: Date { children.reduce(lastModified) { max($0, $1.lastModified) } }
+}
+
+// MARK: - Process discovery
+// Ported from open-vibe-island's ActiveAgentProcessDiscovery: "a session IS a
+// running agent process in a terminal." `ps` finds agent processes (a TTY is
+// required, which excludes headless/background sessions), `lsof` maps each
+// process to the transcript file it holds open. Liveness comes from the OS,
+// never from transcript mtimes.
+
+final class ProcessDiscovery {
+    // Claude Code appends-and-closes its transcript, so lsof usually shows no
+    // open jsonl for it — open-vibe-island falls back to the process cwd (and
+    // claims by tty so a terminal maps to one session). Codex holds its
+    // rollout file open, so the path route always works there.
+    struct Snapshot { let kind: AgentKind; let transcriptPath: String?; let cwd: String? }
+
+    private static let psTimeout: TimeInterval = 0.5
+    private static let lsofTimeout: TimeInterval = 0.2
+
+    func liveTranscripts() -> [Snapshot] {
+        guard let psOut = run("/bin/ps", ["-Ao", "pid=,ppid=,tty=,command="], timeout: Self.psTimeout) else { return [] }
+        var out: [Snapshot] = []
+        var claimed = Set<String>()
+        for line in psOut.split(whereSeparator: \.isNewline) {
+            let parts = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(maxSplits: 3, whereSeparator: \.isWhitespace)
+            guard parts.count == 4 else { continue }
+            let pid = String(parts[0]), tty = String(parts[2])
+            let command = String(parts[3]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard tty != "??", !command.isEmpty else { continue }  // agent must be terminal-attached
+            let kind: AgentKind
+            if isClaude(command) { kind = .claude }
+            else if isCodex(command) { kind = .codex }
+            else { continue }
+            guard let lsof = run("/usr/sbin/lsof", ["-a", "-p", pid, "-Fn"], timeout: Self.lsofTimeout) else { continue }
+            let cwd = workingDirectory(from: lsof)
+            // Claude subagents run in .claude/worktrees/agent-*/ — they are
+            // metadata on the parent session, not sessions of their own.
+            if kind == .claude, let cwd, cwd.contains("/.claude/worktrees/agent-") { continue }
+            switch kind {
+            case .claude:
+                let path = bestClaudeTranscript(in: lsof, cwd: cwd)
+                guard path != nil || cwd != nil else { continue }
+                // claim key: sessionID ?? tty ?? cwd — one session per terminal
+                guard claimed.insert("claude:\(path ?? tty)").inserted else { continue }
+                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
+            case .codex:
+                guard let path = bestCodexTranscript(in: lsof),
+                      claimed.insert("codex:\(path)").inserted else { continue }
+                out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
+            }
+        }
+        return out
+    }
+
+    private func isClaude(_ command: String) -> Bool {
+        let lowered = command.lowercased()
+        if lowered.contains("/.local/bin/claude") { return true }
+        guard let first = lowered.split(separator: " ").first.map(String.init) else { return false }
+        return first == "claude" || first.hasSuffix("/claude")
+    }
+
+    private func isCodex(_ command: String) -> Bool {
+        let lowered = command.lowercased()
+        guard let first = lowered.split(separator: " ").first.map(String.init) else { return false }
+        return first == "codex" || first.hasSuffix("/codex") || lowered.contains("/codex/codex")
+    }
+
+    private func workingDirectory(from lsof: String) -> String? {
+        let lines = lsof.split(whereSeparator: \.isNewline).map(String.init)
+        for i in lines.indices where lines[i] == "fcwd" && lines.indices.contains(i + 1) {
+            let next = lines[i + 1]
+            guard next.first == "n" else { continue }
+            let v = String(next.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+            if v.hasPrefix("/") { return v }
+        }
+        return nil
+    }
+
+    private func paths(in lsof: String, containing fragment: String) -> [String] {
+        lsof.split(whereSeparator: \.isNewline).compactMap {
+            guard $0.first == "n" else { return nil }
+            let v = String($0.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+            return v.contains(fragment) && v.hasSuffix(".jsonl") ? v : nil
+        }
+    }
+
+    private func bestClaudeTranscript(in lsof: String, cwd: String?) -> String? {
+        let all = paths(in: lsof, containing: "/.claude/projects/")
+        // a claude process can hold several project transcripts open; prefer
+        // the one whose encoded project dir matches the process cwd
+        if all.count > 1, let cwd {
+            let encoded = cwd.replacingOccurrences(of: "/", with: "-")
+            if let preferred = all.first(where: { $0.contains(encoded) }) { return preferred }
+        }
+        return all.first
+    }
+
+    private func bestCodexTranscript(in lsof: String) -> String? {
+        // rollout filenames embed a timestamp, so the max name is the newest
+        paths(in: lsof, containing: "/.codex/sessions/").max {
+            URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent
+                < URL(fileURLWithPath: $1).deletingPathExtension().lastPathComponent
+        }
+    }
+
+    private func run(_ path: String, _ args: [String], timeout: TimeInterval) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = Pipe()
+        do { try p.run() } catch { return nil }
+        var data = Data()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            group.leave()
+        }
+        guard group.wait(timeout: .now() + timeout) == .success else { p.terminate(); return nil }
+        return String(data: data, encoding: .utf8)
+    }
 }
 
 // MARK: - Session scanning
@@ -28,9 +156,14 @@ final class SessionScanner {
     private let fm = FileManager.default
     private let home = FileManager.default.homeDirectoryForCurrentUser
 
-    func scan() -> [AgentSession] {
-        let recent: (AgentSession) -> Bool = { Date().timeIntervalSince($0.lastModified) < 6 * 3600 }
-        var sessions = scanClaude().filter(recent) + groupCodex(scanCodex().filter(recent))
+    /// `live` = transcript paths held open by a running agent process;
+    /// `claudeCwdCounts` = encoded-project-dir → number of claude processes
+    /// with that cwd (the fallback when claude exposes no open transcript).
+    /// Together they are the sole source of truth for isRunning.
+    func scan(live: Set<String>, claudeCwdCounts: [String: Int]) -> [AgentSession] {
+        let recent: (AgentSession) -> Bool = { $0.isLive || Date().timeIntervalSince($0.lastModified) < 6 * 3600 }
+        var sessions = scanClaude(live: live, cwdCounts: claudeCwdCounts).filter(recent)
+            + groupCodex(scanCodex(live: live).filter(recent))
         sessions.sort { $0.effectiveLastModified > $1.effectiveLastModified }
         return sessions
     }
@@ -59,27 +192,36 @@ final class SessionScanner {
         return out
     }
 
-    private func scanClaude() -> [AgentSession] {
+    private func scanClaude(live: Set<String>, cwdCounts: [String: Int]) -> [AgentSession] {
         var out: [AgentSession] = []
         let root = home.appendingPathComponent(".claude/projects")
         guard let projects = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return out }
         for proj in projects {
             guard let files = try? fm.contentsOfDirectory(at: proj, includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
-            for f in files where f.pathExtension == "jsonl" {
-                guard let mtime = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else { continue }
+            var dated: [(URL, Date)] = files.compactMap { f in
+                guard f.pathExtension == "jsonl",
+                      let m = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else { return nil }
+                return (f, m)
+            }
+            dated.sort { $0.1 > $1.1 }
+            // cwd fallback: N claude processes in this project dir make its N
+            // newest transcripts live (claude keeps no transcript fd open)
+            let liveByCwd = cwdCounts[proj.lastPathComponent] ?? 0
+            for (idx, (f, mtime)) in dated.enumerated() {
                 let projName = proj.lastPathComponent.split(separator: "-").last.map(String.init) ?? proj.lastPathComponent
                 let info = tailInfo(of: f)
                 var sess = AgentSession(id: f.path, kind: .claude, title: projName,
                                         snippet: info.snippet, model: info.model, lastModified: mtime)
                 sess.prompt = info.prompt
-                sess.children = claudeSubagents(sessionFile: f)
+                sess.isLive = live.contains(f.path) || idx < liveByCwd
+                sess.children = claudeSubagents(sessionFile: f, parentLive: sess.isLive)
                 out.append(sess)
             }
         }
         return out
     }
 
-    private func scanCodex() -> [AgentSession] {
+    private func scanCodex(live: Set<String>) -> [AgentSession] {
         var out: [AgentSession] = []
         let root = home.appendingPathComponent(".codex/sessions")
         guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { return out }
@@ -92,6 +234,7 @@ final class SessionScanner {
             var sess = AgentSession(id: f.path, kind: .codex, title: meta.title,
                                     snippet: info.snippet, model: info.model, lastModified: mtime)
             sess.prompt = info.prompt
+            sess.isLive = live.contains(f.path)
             sess.threadID = meta.id
             sess.parentID = meta.parentID
             sess.nickname = meta.nickname
@@ -101,7 +244,7 @@ final class SessionScanner {
     }
 
     /// Claude Code subagent transcripts live in <proj>/<session-uuid>/subagents/agent-*.jsonl
-    private func claudeSubagents(sessionFile f: URL) -> [AgentSession] {
+    private func claudeSubagents(sessionFile f: URL, parentLive: Bool) -> [AgentSession] {
         let dir = f.deletingPathExtension().appendingPathComponent("subagents")
         guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return [] }
         var kids: [AgentSession] = []
@@ -113,6 +256,9 @@ final class SessionScanner {
                                    snippet: info.snippet, model: info.model, lastModified: mtime)
             // no nicknames here — label with the task it was given
             kid.nickname = info.prompt.isEmpty ? "subagent" : String(info.prompt.prefix(40))
+            // subagents share the parent process (open-vibe-island tracks them
+            // as parent metadata) — liveness inherits, busyness from writes
+            kid.isLive = parentLive
             kids.append(kid)
         }
         return kids.sorted { $0.lastModified > $1.lastModified }
@@ -216,6 +362,7 @@ final class SessionScanner {
 /// Row icon: mini mascot / Codex pet while running, green pixel checkmark when done.
 final class DitherIconView: NSView {
     var running = false
+    var idle = false  // alive but quiet: dim, static
     var kind: AgentKind = .claude
     var color: NSColor = .systemBlue  // kept for tint fallbacks
     var t: CGFloat = 0 { didSet { needsDisplay = true } }
@@ -227,7 +374,7 @@ final class DitherIconView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        if !running {
+        if !running && !idle {
             // done: green pixel checkmark
             let cell: CGFloat = 2.2
             for (x, y) in Self.checkmark {
@@ -237,18 +384,19 @@ final class DitherIconView: NSView {
             }
             return
         }
+        let alpha: CGFloat = idle ? 0.4 : 1.0
         if kind == .codex, let sprite = IndicatorView.codexSprite {
             let fw: CGFloat = 192, fh: CGFloat = 208
-            let idx = Int(t / 0.12) % 8
+            let idx = idle ? 0 : Int(t / 0.12) % 8
             let src = NSRect(x: CGFloat(idx) * fw, y: 1872 - 2 * fh, width: fw, height: fh)
             NSGraphicsContext.current?.imageInterpolation = .none
             sprite.draw(in: NSRect(x: 1, y: 0, width: 16 * fw / fh, height: 16),
-                        from: src, operation: .sourceOver, fraction: 1)
+                        from: src, operation: .sourceOver, fraction: alpha)
             return
         }
-        // mini Claude mascot walking, with a visible bob
+        // mini Claude mascot walking, with a visible bob (static + dim when idle)
         let subW: CGFloat = 1.0, subH: CGFloat = 2.0
-        let walk = Int(t * 2.5)
+        let walk = idle ? 0 : Int(t * 2.5)
         let frame = IndicatorView.mascotFrames[walk % 2]
         let rows = frame.count * 2
         let y0 = CGFloat(rows) * subH + 1 + (walk % 2 == 0 ? 0 : 1.5)
@@ -257,7 +405,7 @@ final class DitherIconView: NSView {
                 guard let q = IndicatorView.quadrants[ch] else { continue }
                 let cells = [(q.0, 0, 0), (q.1, 1, 0), (q.2, 0, 1), (q.3, 1, 1)]
                 for (on, qx, qy) in cells where on {
-                    ctx.setFillColor(IndicatorView.claudeOrange.cgColor)
+                    ctx.setFillColor(IndicatorView.claudeOrange.withAlphaComponent(alpha).cgColor)
                     ctx.fill(CGRect(x: CGFloat(i * 2 + qx) * subW,
                                     y: y0 - CGFloat(j * 2 + qy + 1) * subH,
                                     width: subW - 0.2, height: subH - 0.3))
@@ -364,7 +512,8 @@ final class SessionListController: NSViewController {
 
     private func childRow(for s: AgentSession) -> NSView {
         let icon = DitherIconView()
-        icon.running = s.isRunning
+        icon.running = s.isBusy
+        icon.idle = s.isLive && !s.isBusy
         icon.kind = s.kind
         icon.translatesAutoresizingMaskIntoConstraints = false
         icon.widthAnchor.constraint(equalToConstant: 16).isActive = true
@@ -372,7 +521,7 @@ final class SessionListController: NSViewController {
         icons.append(icon)
         let name = label(s.nickname ?? (s.title.isEmpty ? s.kind.rawValue : s.title), size: 11, color: .secondaryLabelColor, bold: true)
         let tag = label("\(s.model.isEmpty ? s.kind.rawValue : s.model) · \(relative(s.lastModified))", size: 9,
-                        color: (s.isRunning ? NSColor.systemBlue : .systemGreen).withAlphaComponent(0.6), bold: false)
+                        color: (s.isBusy ? NSColor.systemBlue : s.isLive ? .secondaryLabelColor : .systemGreen).withAlphaComponent(0.6), bold: false)
         tag.setContentCompressionResistancePriority(.required, for: .horizontal)
         let top = NSStackView(views: [icon, name, NSView(), tag])
         top.orientation = .horizontal
@@ -399,7 +548,8 @@ final class SessionListController: NSViewController {
 
     private func row(for s: AgentSession) -> NSView {
         let icon = DitherIconView()
-        icon.running = s.anyRunning
+        icon.running = s.anyBusy
+        icon.idle = s.anyLive && !s.anyBusy
         icon.kind = s.kind
         icon.translatesAutoresizingMaskIntoConstraints = false
         icon.widthAnchor.constraint(equalToConstant: 16).isActive = true
@@ -407,7 +557,7 @@ final class SessionListController: NSViewController {
         icons.append(icon)
         let title = label(s.kind.rawValue, size: 12, color: .labelColor, bold: true)
         let tag = label("\(s.model.isEmpty ? s.title : s.model) · \(relative(s.lastModified))", size: 10,
-                        color: (s.anyRunning ? NSColor.systemBlue : .systemGreen).withAlphaComponent(0.75), bold: false)
+                        color: (s.anyBusy ? NSColor.systemBlue : s.anyLive ? .secondaryLabelColor : .systemGreen).withAlphaComponent(0.75), bold: false)
         tag.setContentCompressionResistancePriority(.required, for: .horizontal)
         let top = NSStackView(views: [icon, title, NSView(), tag])
         top.orientation = .horizontal
@@ -663,9 +813,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let notchView = NotchView()
     private let indicatorView = IndicatorView()
     private let scanner = SessionScanner()
+    private let discovery = ProcessDiscovery()
+    private let scanQueue = DispatchQueue(label: "agent-notch.scan", qos: .utility)
+    // open-vibe-island removal rule: a transcript's process must be missing
+    // for 2 consecutive polls (~6 s) before its session stops being live
+    private var missCounts: [String: Int] = [:]
     private let listController = SessionListController()
     private var frame = 0
-    private var wasRunning = false
+    private var claudeWasLive = false
+    private var codexWasLive = false
     private var claudeState: AgentGlyphState = .inactive
     private var codexState: AgentGlyphState = .inactive
     private var expanded = false
@@ -795,7 +951,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in self?.tick() }
         rescan()
-        Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in self?.rescan() }
+        // 3 s poll cadence, matching open-vibe-island's process discovery
+        Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in self?.rescan() }
     }
 
     /// Screen rect of the indicator — the only collapsed region that should catch clicks
@@ -875,9 +1032,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func rescan() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        scanQueue.async { [weak self] in
             guard let self else { return }
-            let result = self.scanner.scan()
+            // Process discovery is the authoritative liveness signal. Keys are
+            // transcript paths, or "cwd#<encoded>#<i>" for claude's cwd fallback.
+            var seen = Set<String>()
+            var cwdIndex: [String: Int] = [:]
+            for snap in self.discovery.liveTranscripts() {
+                if let path = snap.transcriptPath {
+                    seen.insert(path)
+                } else if snap.kind == .claude, let cwd = snap.cwd {
+                    let encoded = cwd.replacingOccurrences(of: "/", with: "-")
+                    let i = cwdIndex[encoded, default: 0]
+                    cwdIndex[encoded] = i + 1
+                    seen.insert("cwd#\(encoded)#\(i)")
+                }
+            }
+            for p in seen { self.missCounts[p] = 0 }
+            for (p, n) in self.missCounts where !seen.contains(p) {
+                if n + 1 >= 2 { self.missCounts.removeValue(forKey: p) } else { self.missCounts[p] = n + 1 }
+            }
+            var live = Set<String>()
+            var cwdCounts: [String: Int] = [:]
+            for key in self.missCounts.keys {
+                if key.hasPrefix("cwd#") {
+                    let encoded = String(key.dropFirst(4).split(separator: "#")[0])
+                    cwdCounts[encoded, default: 0] += 1
+                } else {
+                    live.insert(key)
+                }
+            }
+            let result = self.scanner.scan(live: live, claudeCwdCounts: cwdCounts)
             DispatchQueue.main.async {
                 // Track fullscreen-space changes: full-width bar when the menu bar is hidden
                 if !self.expanded, !self.animating {
@@ -890,11 +1075,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 IndicatorView.refreshPetChoice()
                 self.listController.sessions = result
-                let claudeNow = result.contains { $0.kind == .claude && $0.anyRunning }
-                let codexNow = result.contains { $0.kind == .codex && $0.anyRunning }
-                self.claudeState = claudeNow ? .running : (self.claudeState == .running ? .done : self.claudeState)
-                self.codexState = codexNow ? .running : (self.codexState == .running ? .done : self.codexState)
-                self.wasRunning = claudeNow || codexNow
+                // busy → mascot; alive-but-quiet → nothing (idle, not done);
+                // process exited → done blob (cleared on terminal focus)
+                let claudeLive = result.contains { $0.kind == .claude && $0.anyLive }
+                let claudeBusy = result.contains { $0.kind == .claude && $0.anyBusy }
+                let codexLive = result.contains { $0.kind == .codex && $0.anyLive }
+                let codexBusy = result.contains { $0.kind == .codex && $0.anyBusy }
+                self.claudeState = claudeBusy ? .running
+                    : claudeLive ? .inactive
+                    : (self.claudeWasLive ? .done : self.claudeState)
+                self.codexState = codexBusy ? .running
+                    : codexLive ? .inactive
+                    : (self.codexWasLive ? .done : self.codexState)
+                self.claudeWasLive = claudeLive
+                self.codexWasLive = codexLive
                 self.render()
             }
         }

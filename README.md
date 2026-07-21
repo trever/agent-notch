@@ -14,12 +14,19 @@ One row per session, titled by the tool, led by **your** latest prompt — not t
 
 ## How it works
 
-No hooks, no APIs, no accounts — it just polls the transcript files both CLIs already write, every 2 s:
+No hooks, no APIs, no accounts. Liveness detection follows [open-vibe-island](https://github.com/Octane0411/open-vibe-island)'s model — *a session is a running agent process in a terminal* — polled every 3 s:
 
-- Claude Code: `~/.claude/projects/*/*.jsonl` (+ `<session>/subagents/agent-*.jsonl`)
-- Codex: `~/.codex/sessions/**/*.jsonl`, grouped by `parent_thread_id`
+- `ps` finds `claude`/`codex` processes attached to a TTY (headless/background sessions are ignored)
+- `lsof` maps each process to the transcript it holds open (Codex), or to its working directory (Claude Code, which doesn't keep the transcript fd open)
+- transcripts provide the metadata: prompts, snippets, models, subagents
+  - Claude Code: `~/.claude/projects/*/*.jsonl` (+ `<session>/subagents/agent-*.jsonl`)
+  - Codex: `~/.codex/sessions/**/*.jsonl`, grouped by `parent_thread_id`
 
-A transcript modified in the last 20 s counts as *running*. Sessions idle over 6 h drop off. Activating a terminal app (Ghostty, Terminal, iTerm2, kitty, Warp, Alacritty) acknowledges finished agents and clears their green indicator.
+Within a live session, *busy vs idle* is a hybrid: process alive + transcript written in the last 30 s = busy (mascot walks); alive but quiet = idle (nothing in the notch, dimmed row in the panel); process gone for 2 polls = done (green blob). Sessions idle over 6 h drop off the panel. Activating a terminal app (Ghostty, Terminal, iTerm2, kitty, Warp, Alacritty) acknowledges finished agents and clears their green indicator.
+
+### Known limitation: the ~30 s afterglow
+
+Busy/idle is inferred from transcript write times, and transcript writes are bursty — so the mascot keeps walking for up to ~33 s (30 s window + 3 s poll) after a turn actually ends, and conversely a turn's quiet stretches are smoothed over. No process-level proxy (network, CPU, child processes) can fully fix this: only the agent knows when its turn ends. The precise fix would be agent hooks (`UserPromptSubmit`/`Stop` writing a state file, as open-vibe-island does), deliberately skipped here to keep the zero-config, no-hooks design. If the afterglow bothers you, that's the upgrade path.
 
 The collapsed window is transparent and fully click-through except the tiny indicator zone, so it never blocks menu items or apps underneath. In fullscreen spaces the bar spans the whole top edge.
 
