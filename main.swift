@@ -186,6 +186,13 @@ final class SessionScanner {
             var parent = byID[key] ?? members.sorted { $0.lastModified > $1.lastModified }[0]
             var kids = members.filter { $0.threadID != parent.threadID }
             kids.sort { $0.lastModified > $1.lastModified }
+            // One codex process serves the whole thread group but holds only
+            // its most recently opened rollout fd — so liveness observed on
+            // any member means the shared process is alive for all of them.
+            if parent.isLive || kids.contains(where: { $0.isLive }) {
+                parent.isLive = true
+                for i in kids.indices { kids[i].isLive = true }
+            }
             parent.children = kids
             out.append(parent)
         }
@@ -1104,6 +1111,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         indicatorView.codexState = codexState
         indicatorView.t = CGFloat(frame) * 0.12
     }
+}
+
+// Debug: `./AgentNotch --scan` prints one discovery + scan cycle and exits.
+if CommandLine.arguments.contains("--scan") {
+    let snaps = ProcessDiscovery().liveTranscripts()
+    print("== process discovery ==")
+    for s in snaps { print("\(s.kind.rawValue): path=\(s.transcriptPath ?? "nil") cwd=\(s.cwd ?? "nil")") }
+    var live = Set<String>()
+    var cwdCounts: [String: Int] = [:]
+    for s in snaps {
+        if let p = s.transcriptPath { live.insert(p) }
+        else if s.kind == .claude, let c = s.cwd { cwdCounts[c.replacingOccurrences(of: "/", with: "-"), default: 0] += 1 }
+    }
+    print("== sessions ==")
+    for s in SessionScanner().scan(live: live, claudeCwdCounts: cwdCounts) {
+        print("\(s.kind.rawValue) [\(s.title)] live=\(s.isLive) busy=\(s.isBusy) mtime=\(-s.lastModified.timeIntervalSinceNow)s kids=\(s.children.count)")
+    }
+    exit(0)
 }
 
 let app = NSApplication.shared
