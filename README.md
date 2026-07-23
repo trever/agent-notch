@@ -14,15 +14,15 @@ One row per session, titled by the tool, led by **your** latest prompt — not t
 
 ## How it works
 
-No hooks, no APIs, no accounts. Liveness detection follows [open-vibe-island](https://github.com/Octane0411/open-vibe-island)'s model — *a session is a running agent process in a terminal* — polled every 3 s:
+No hooks, no APIs, no accounts. Liveness detection follows [open-vibe-island](https://github.com/Octane0411/open-vibe-island)'s model — *a session is a running agent process* — polled every 3 s:
 
-- `ps` finds `claude`/`codex` processes attached to a TTY (headless/background sessions are ignored)
+- `ps` finds `claude`/`codex` processes, whether attached to a terminal or running headless — the **Claude desktop app** spawns real `claude` processes with piped stdio (no TTY), and those are tracked too. Non-session helpers are filtered out downstream: a process only counts once it maps to an open transcript (Codex) or a working directory (Claude).
 - `lsof` maps each process to the transcript it holds open (Codex), or to its working directory (Claude Code, which doesn't keep the transcript fd open)
 - transcripts provide the metadata: prompts, snippets, models, subagents
   - Claude Code: `~/.claude/projects/*/*.jsonl` (+ `<session>/subagents/agent-*.jsonl`)
   - Codex: `~/.codex/sessions/**/*.jsonl`, grouped by `parent_thread_id`
 
-Within a live session, *busy vs idle* is a hybrid: process alive + transcript written in the last 30 s = busy (mascot walks); alive but quiet = idle (nothing in the notch, dimmed row in the panel); process gone for 2 polls = done (green blob). Sessions idle over 6 h drop off the panel. Activating a terminal app (Ghostty, Terminal, iTerm2, kitty, Warp, Alacritty) acknowledges finished agents and clears their green indicator.
+Within a live session, *busy vs idle* is a hybrid: process alive + transcript written in the last 30 s = busy (mascot walks); alive but quiet = idle (nothing in the notch, dimmed row in the panel); process gone for 2 polls = done (green blob). Sessions idle over 6 h drop off the panel. Activating the app the agent lives in — a terminal (Ghostty, Terminal, iTerm2, kitty, Warp, Alacritty) or the Claude desktop app / Cursor — acknowledges finished agents and clears their green indicator.
 
 ### Known limitation: the ~30 s afterglow
 

@@ -57,7 +57,11 @@ final class ProcessDiscovery {
             guard parts.count == 4 else { continue }
             let pid = String(parts[0]), tty = String(parts[2])
             let command = String(parts[3]).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard tty != "??", !command.isEmpty else { continue }  // agent must be terminal-attached
+            // Accept headless (tty "??") agents too: the Claude desktop app spawns
+            // real `claude` processes with piped stdio, so they have no controlling
+            // terminal. False positives are still filtered downstream — a session
+            // must map to an open transcript (Codex) or a working dir (Claude).
+            guard !command.isEmpty else { continue }
             if isClaude(command) { candidates.append((pid, tty, .claude)) }
             else if isCodex(command) { candidates.append((pid, tty, .codex)) }
         }
@@ -74,14 +78,20 @@ final class ProcessDiscovery {
             case .claude:
                 let path = bestClaudeTranscript(in: lsof, cwd: cwd)
                 guard path != nil || cwd != nil else { continue }
-                // claim key: sessionID ?? tty ?? cwd — one session per terminal
-                guard claimed.insert("claude:\(path ?? tty)").inserted else { continue }
+                // claim key: transcript ?? tty ?? cwd — one session per terminal, or
+                // per working dir for headless (desktop) sessions that share tty "??".
+                let claimKey = path ?? (tty != "??" ? tty : (cwd ?? pid))
+                guard claimed.insert("claude:\(claimKey)").inserted else { continue }
                 out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
             case .codex:
                 guard let path = bestCodexTranscript(in: lsof),
                       claimed.insert("codex:\(path)").inserted else { continue }
                 out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
             }
+        }
+        if ProcessInfo.processInfo.environment["AGENT_NOTCH_DEBUG"] != nil {
+            let desc = out.map { "\($0.kind) \($0.cwd ?? $0.transcriptPath ?? "?")" }.joined(separator: ", ")
+            FileHandle.standardError.write(Data("agent-notch: \(out.count) live [\(desc)]\n".utf8))
         }
         return out
     }
@@ -106,17 +116,24 @@ final class ProcessDiscovery {
         return chunks
     }
 
-    private func isClaude(_ command: String) -> Bool {
-        let lowered = command.lowercased()
-        if lowered.contains("/.local/bin/claude") { return true }
-        guard let first = lowered.split(separator: " ").first.map(String.init) else { return false }
-        return first == "claude" || first.hasSuffix("/claude")
+    // The command is the full argv joined by spaces, and the Claude desktop app's
+    // CLI binary path contains a space ("…/Application Support/Claude/…/claude"),
+    // so we can't split off a first token to find the executable — match the exe
+    // pattern directly. This also matches the desktop `disclaimer` wrapper (it has
+    // the same cwd as its child claude, so the cwd claim key dedups them into one).
+    //
+    // Matching is CASE-SENSITIVE on purpose: the CLI binary is lowercase `claude`,
+    // while the Electron desktop app itself is `…/Claude.app/Contents/MacOS/Claude`
+    // (capital C, cwd "/") — lowercasing would wrongly match that GUI process.
+    private func isClaude(_ s: String) -> Bool {
+        return s == "claude" || s.hasPrefix("claude ")
+            || s.hasSuffix("/claude") || s.contains("/claude ")
     }
 
-    private func isCodex(_ command: String) -> Bool {
-        let lowered = command.lowercased()
-        guard let first = lowered.split(separator: " ").first.map(String.init) else { return false }
-        return first == "codex" || first.hasSuffix("/codex") || lowered.contains("/codex/codex")
+    private func isCodex(_ s: String) -> Bool {
+        return s == "codex" || s.hasPrefix("codex ")
+            || s.hasSuffix("/codex") || s.contains("/codex ")
+            || s.contains("/codex/codex")
     }
 
     private func workingDirectory(from lsof: String) -> String? {
@@ -982,14 +999,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.orderFrontRegardless()
         indicatorWindow.orderFrontRegardless()
 
-        // Revisiting the terminal acknowledges finished agents — green clears
+        // Revisiting where the agent lives acknowledges finished agents — green
+        // clears. Terminals for CLI sessions, plus the Claude desktop app and
+        // Cursor, which host headless `claude`/`codex` sessions of their own.
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] note in
             guard let self,
                   let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
             let terminals = ["com.mitchellh.ghostty", "com.apple.Terminal", "com.googlecode.iterm2",
-                             "net.kovidgoyal.kitty", "dev.warp.Warp-Stable", "io.alacritty"]
+                             "net.kovidgoyal.kitty", "dev.warp.Warp-Stable", "io.alacritty",
+                             "com.anthropic.claudefordesktop", "com.todesktop.230313mzl4w4u92"]
             if terminals.contains(app.bundleIdentifier ?? "") {
                 if self.claudeState == .done { self.claudeState = .inactive }
                 if self.codexState == .done { self.codexState = .inactive }
