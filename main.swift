@@ -765,9 +765,15 @@ final class IndicatorView: NSView {
     private static var spriteCache: [String: NSImage] = [:]
     static var codexSprite: NSImage? {
         if let img = spriteCache[currentPetID] { return img }
-        let path = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Documents/GitHub/agent-notch/pets/pet-\(currentPetID).webp").path
-        guard let img = NSImage(contentsOfFile: path) else { return nil }
+        // Prefer pets bundled inside the .app (Resources/); fall back to the
+        // source-tree location for running straight out of the repo in dev.
+        let candidates = [
+            Bundle.main.url(forResource: "pet-\(currentPetID)", withExtension: "webp")?.path,
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Documents/GitHub/agent-notch/pets/pet-\(currentPetID).webp").path,
+        ].compactMap { $0 }
+        guard let path = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }),
+              let img = NSImage(contentsOfFile: path) else { return nil }
         spriteCache[currentPetID] = img
         return img
     }
