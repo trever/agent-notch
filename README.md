@@ -2,7 +2,7 @@
 
 Your AI agents, living next to the MacBook notch.
 
-While **Claude Code** or **Codex** is working, its mascot walks beside the notch — the Claude Code banner critter for Claude, the official Codex pet for Codex. Each agent has its own slot: the moment one finishes, its mascot becomes a green blob (even while the other keeps working). The green is a "finished since you last looked" notification — focusing your terminal clears it. Click to open a panel of your sessions, grouped by prompt, with every subagent tucked under a dropdown.
+While **Claude Code** or **Codex** is working, its mascot walks beside the notch — the Claude Code banner critter for Claude, the official Codex pet for Codex. Each agent has its own slot: the moment one finishes, its mascot becomes a green blob (even while the other keeps working). The green is a "finished since you last looked" notification — focusing your terminal clears it. Beside the mascot, a single line says what's happening *right now* ("Writing main.swift", "Running git", "Delegating a subagent"), with a badge when more than one session is live. Hover the island — or click it — to open a panel of your sessions, grouped by prompt, with every subagent tucked under a dropdown.
 
 <p align="center"><img src="docs/indicator.gif" width="520" alt="Claude Code mascot and Codex pet walking beside the notch" /></p>
 
@@ -47,6 +47,6 @@ swiftc -O main.swift -o AgentNotch
 ./AgentNotch &
 ```
 
-- **Click** the indicator → open the panel. Click anywhere → close.
+- **Hover** the island → the panel expands (moving away collapses it again). **Click** it → the panel pins open; click anywhere else → close.
 - To start at login: System Settings → General → Login Items → add `AgentNotch`.
 - Requires macOS 12+ (built and tested on a notched MacBook; on notchless displays it centers on a virtual notch).

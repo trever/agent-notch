@@ -13,6 +13,9 @@ struct AgentSession {
     let model: String
     let lastModified: Date
     var prompt: String = ""
+    /// What the agent is doing right now, from the newest tool call in the
+    /// transcript ("Writing main.swift", "Running git"). Empty when unknown.
+    var activity: String = ""
     var threadID: String = ""
     var parentID: String?
     var nickname: String?
@@ -30,8 +33,8 @@ struct AgentSession {
 
 // MARK: - Process discovery
 // Ported from open-vibe-island's ActiveAgentProcessDiscovery: "a session IS a
-// running agent process in a terminal." `ps` finds agent processes (a TTY is
-// required, which excludes headless/background sessions), `lsof` maps each
+// running agent process." `ps` finds agent processes — terminal-attached or
+// headless, since the Claude desktop app spawns its own — and `lsof` maps each
 // process to the transcript file it holds open. Liveness comes from the OS,
 // never from transcript mtimes.
 
@@ -88,10 +91,6 @@ final class ProcessDiscovery {
                       claimed.insert("codex:\(path)").inserted else { continue }
                 out.append(Snapshot(kind: kind, transcriptPath: path, cwd: cwd))
             }
-        }
-        if ProcessInfo.processInfo.environment["AGENT_NOTCH_DEBUG"] != nil {
-            let desc = out.map { "\($0.kind) \($0.cwd ?? $0.transcriptPath ?? "?")" }.joined(separator: ", ")
-            FileHandle.standardError.write(Data("agent-notch: \(out.count) live [\(desc)]\n".utf8))
         }
         return out
     }
@@ -265,6 +264,7 @@ final class SessionScanner {
                 var sess = AgentSession(id: f.path, kind: .claude, title: projName,
                                         snippet: info.snippet, model: info.model, lastModified: mtime)
                 sess.prompt = info.prompt
+                sess.activity = info.tool
                 sess.lastActivity = info.activity
                 sess.isLive = live.contains(f.path) || idx < liveByCwd
                 sess.children = claudeSubagents(sessionFile: f, parentLive: sess.isLive)
@@ -287,6 +287,7 @@ final class SessionScanner {
             var sess = AgentSession(id: f.path, kind: .codex, title: meta.title,
                                     snippet: info.snippet, model: info.model, lastModified: mtime)
             sess.prompt = info.prompt
+            sess.activity = info.tool
             sess.isLive = live.contains(f.path)
             sess.threadID = meta.id
             sess.parentID = meta.parentID
@@ -340,24 +341,31 @@ final class SessionScanner {
 
     /// Read the tail of a jsonl transcript: last human-readable text + model
     /// name + timestamp of the last conversational (user/assistant) entry.
-    private func tailInfo(of file: URL) -> (snippet: String, model: String, prompt: String, activity: Date?) {
-        guard let fh = try? FileHandle(forReadingFrom: file) else { return ("", "", "", nil) }
+    private func tailInfo(of file: URL) -> (snippet: String, model: String, prompt: String, activity: Date?, tool: String) {
+        guard let fh = try? FileHandle(forReadingFrom: file) else { return ("", "", "", nil, "") }
         defer { try? fh.close() }
         let size = (try? fh.seekToEnd()) ?? 0
         let readLen: UInt64 = min(size, 131_072)
         try? fh.seek(toOffset: size - readLen)
         guard let data = try? fh.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else { return ("", "", "", nil) }
-        var snippet = "", model = "", prompt = ""
+              let text = String(data: data, encoding: .utf8) else { return ("", "", "", nil, "") }
+        var snippet = "", model = "", prompt = "", tool = ""
         var activity: Date?
+        // The newest tool call wins, but only if nothing the agent *said* came
+        // after it — once it starts talking again the tool is no longer current.
+        var sawTextAfterTool = false
         for line in text.split(separator: "\n").reversed() {
             if model.isEmpty, let r = line.range(of: #""model":"([^"]+)""#, options: .regularExpression) {
                 model = String(line[r].dropFirst(9).dropLast(1))
                 model = model.replacingOccurrences(of: "claude-", with: "")
             }
-            if snippet.isEmpty || prompt.isEmpty || activity == nil,
+            if snippet.isEmpty || prompt.isEmpty || activity == nil || tool.isEmpty,
                let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] {
-                if snippet.isEmpty, let s = extractText(obj) { snippet = s }
+                if tool.isEmpty, !sawTextAfterTool, let t = extractToolActivity(obj) { tool = t }
+                if snippet.isEmpty, let s = extractText(obj) {
+                    snippet = s
+                    if tool.isEmpty { sawTextAfterTool = true }
+                }
                 if prompt.isEmpty, let p = extractUserPrompt(obj) { prompt = p }
                 // "system" entries (away_summary, compaction notes…) are
                 // housekeeping, not activity
@@ -367,7 +375,7 @@ final class SessionScanner {
                     activity = Self.isoParser.date(from: ts)
                 }
             }
-            if !snippet.isEmpty && !model.isEmpty && !prompt.isEmpty && activity != nil { break }
+            if !snippet.isEmpty && !model.isEmpty && !prompt.isEmpty && activity != nil && !tool.isEmpty { break }
         }
         if model.isEmpty, size > readLen {
             // model can appear only early in long transcripts — check the head too
@@ -379,7 +387,69 @@ final class SessionScanner {
                     .replacingOccurrences(of: "claude-", with: "")
             }
         }
-        return (snippet, model, prompt, activity)
+        return (snippet, model, prompt, activity, tool)
+    }
+
+    /// The newest tool call on this entry, phrased for the notch.
+    private func extractToolActivity(_ obj: [String: Any]) -> String? {
+        // Claude: {"message":{"content":[{"type":"tool_use","name":..,"input":{..}}]}}
+        if let msg = obj["message"] as? [String: Any],
+           let arr = msg["content"] as? [[String: Any]] {
+            for part in arr.reversed() where part["type"] as? String == "tool_use" {
+                return describeTool(name: part["name"] as? String ?? "",
+                                    input: part["input"] as? [String: Any] ?? [:])
+            }
+        }
+        // Codex: {"payload":{"type":"function_call","name":..,"arguments":"{json}"}}
+        if let payload = obj["payload"] as? [String: Any],
+           payload["type"] as? String == "function_call",
+           let name = payload["name"] as? String {
+            var input: [String: Any] = [:]
+            if let raw = payload["arguments"] as? String,
+               let d = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] { input = d }
+            return describeTool(name: name, input: input)
+        }
+        return nil
+    }
+
+    private func describeTool(name: String, input: [String: Any]) -> String? {
+        guard !name.isEmpty else { return nil }
+        func base(_ key: String) -> String? {
+            guard let p = input[key] as? String, !p.isEmpty else { return nil }
+            return URL(fileURLWithPath: p).lastPathComponent
+        }
+        // MCP tools arrive as mcp__server__tool — show the tool half
+        let short = name.hasPrefix("mcp__")
+            ? name.split(separator: "_").filter { !$0.isEmpty }.last.map(String.init) ?? name
+            : name
+        switch short {
+        case "Write", "Edit", "MultiEdit", "NotebookEdit":
+            return "Writing " + (base("file_path") ?? base("notebook_path") ?? "a file")
+        case "Read":
+            return "Reading " + (base("file_path") ?? base("notebook_path") ?? "a file")
+        case "Grep":
+            return "Searching " + ((input["pattern"] as? String) ?? "files")
+        case "Glob":
+            return "Finding " + ((input["pattern"] as? String) ?? "files")
+        case "Bash", "shell", "local_shell":
+            var cmd = (input["command"] as? String) ?? ""
+            if cmd.isEmpty, let arr = input["command"] as? [String] { cmd = arr.last ?? "" }
+            // "cd repo && swiftc main.swift" — the cd is scaffolding, not the point
+            let segment = cmd.components(separatedBy: CharacterSet(charactersIn: "&;|\n"))
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .first { !$0.isEmpty && $0 != "cd" && !$0.hasPrefix("cd ") } ?? cmd
+            let word = segment.split(whereSeparator: \.isWhitespace).first.map(String.init)
+            return "Running " + (word ?? "a command")
+        case "WebFetch":
+            let host = (input["url"] as? String).flatMap { URL(string: $0)?.host }
+            return "Fetching " + (host ?? "the web")
+        case "WebSearch": return "Searching the web"
+        case "Task", "Agent": return "Delegating " + ((input["description"] as? String) ?? "a subagent")
+        case "Skill": return "Running a skill"
+        case "TodoWrite", "TaskCreate", "TaskUpdate": return "Planning"
+        case "apply_patch", "ApplyPatch": return "Writing a patch"
+        default: return "Running " + short
+        }
     }
 
     /// The user's own message, if this line is one.
@@ -676,6 +746,23 @@ final class IndicatorView: NSView {
     var claudeState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
     var codexState: AgentGlyphState = .inactive { didSet { needsDisplay = true } }
     var t: CGFloat = 0 { didSet { needsDisplay = true } }
+    /// One line of what's happening right now, drawn left of the mascots.
+    var statusText: String = "" { didSet { if statusText != oldValue { needsDisplay = true } } }
+    /// Shown as a pill when more than one session is live.
+    var badgeCount: Int = 0 { didSet { if badgeCount != oldValue { needsDisplay = true } } }
+
+    static let statusFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+    static let badgeFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
+
+    /// Width the status line needs, so the window can size itself to fit.
+    static func statusWidth(text: String, badge: Int) -> CGFloat {
+        guard !text.isEmpty else { return 0 }
+        var w = (text as NSString).size(withAttributes: [.font: statusFont]).width + 8
+        if badge > 1 {
+            w += ("\(badge)" as NSString).size(withAttributes: [.font: badgeFont]).width + 10 + 8
+        }
+        return ceil(w)
+    }
 
     static let claudeOrange = NSColor(red: 0.85, green: 0.47, blue: 0.34, alpha: 1)  // Anthropic coral
     static let codexTeal = NSColor(red: 0.06, green: 0.64, blue: 0.50, alpha: 1)     // OpenAI teal
@@ -718,10 +805,39 @@ final class IndicatorView: NSView {
         case .inactive: break
         }
         switch codexState {
-        case .running: _ = drawCodexPet(ctx, right: x, cy: cy)
-        case .done: drawGreenBlob(ctx, right: x, cy: cy)
+        case .running: x = drawCodexPet(ctx, right: x, cy: cy) - 6
+        case .done: drawGreenBlob(ctx, right: x, cy: cy); x -= 24
         case .inactive: break
         }
+        drawStatus(ctx, right: x, cy: cy)
+    }
+
+    /// "Writing main.swift  ⟨3⟩" — laid out right-to-left from the mascots, so
+    /// the line grows leftward along the menu bar and never crosses the notch.
+    private func drawStatus(_ ctx: CGContext, right: CGFloat, cy: CGFloat) {
+        guard !statusText.isEmpty else { return }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: Self.statusFont,
+            .foregroundColor: NSColor.white.withAlphaComponent(0.80),
+        ]
+        let s = NSAttributedString(string: statusText, attributes: attrs)
+        let size = s.size()
+        var x = right - 4 - size.width
+        s.draw(at: NSPoint(x: x, y: cy - size.height / 2))
+
+        guard badgeCount > 1 else { return }
+        let b = NSAttributedString(string: "\(badgeCount)", attributes: [
+            .font: Self.badgeFont,
+            .foregroundColor: NSColor.white.withAlphaComponent(0.72),
+        ])
+        let bsize = b.size()
+        let bw = bsize.width + 10, bh: CGFloat = 15
+        x -= 8 + bw
+        let rect = CGRect(x: x, y: cy - bh / 2, width: bw, height: bh)
+        ctx.setFillColor(NSColor.white.withAlphaComponent(0.14).cgColor)
+        ctx.addPath(CGPath(roundedRect: rect, cornerWidth: 4, cornerHeight: 4, transform: nil))
+        ctx.fillPath()
+        b.draw(at: NSPoint(x: rect.midX - bsize.width / 2, y: rect.midY - bsize.height / 2))
     }
 
     private func drawGreenBlob(_ ctx: CGContext, right: CGFloat, cy: CGFloat) {
@@ -901,6 +1017,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var codexState: AgentGlyphState = .inactive
     private var expanded = false
 
+    // Hover-to-expand
+    private let hoverDelay: TimeInterval = 0.35
+    private var hoverWork: DispatchWorkItem?
+    private var leaveWork: DispatchWorkItem?
+    private var openedByHover = false
+    /// Pixel width the collapsed status line currently needs.
+    private var statusPixelWidth: CGFloat = 0
+
     // Geometry
     private var screen: NSScreen { NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main! }
     private var notchWidth: CGFloat {
@@ -988,14 +1112,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let loc = NSEvent.mouseLocation
             let now = ProcessInfo.processInfo.systemUptime
             if !self.expanded {
-                if self.indicatorScreenRect.insetBy(dx: -4, dy: 0).contains(loc), now - lastToggle > 0.15 {
+                if self.indicatorClickRect.insetBy(dx: -4, dy: 0).contains(loc), now - lastToggle > 0.15 {
                     lastToggle = now
+                    self.openedByHover = false
                     self.setExpanded(true)
                 }
             } else if !self.window.frame.contains(loc) {
                 self.setExpanded(false)
             }
         }
+
+        // Hover the island to expand it; leaving collapses it again — but only
+        // when hover opened it, so a deliberate click still pins the panel.
+        let onMove: (NSEvent) -> Void = { [weak self] _ in
+            guard let self else { return }
+            let loc = NSEvent.mouseLocation
+            if !self.expanded {
+                let inside = self.indicatorScreenRect.insetBy(dx: -4, dy: 0).contains(loc)
+                    && (self.claudeState != .inactive || self.codexState != .inactive)
+                if inside {
+                    if self.hoverWork == nil {
+                        let work = DispatchWorkItem { [weak self] in
+                            guard let self, !self.expanded else { return }
+                            self.hoverWork = nil
+                            self.openedByHover = true
+                            self.setExpanded(true)
+                        }
+                        self.hoverWork = work
+                        DispatchQueue.main.asyncAfter(deadline: .now() + self.hoverDelay, execute: work)
+                    }
+                } else {
+                    self.hoverWork?.cancel()
+                    self.hoverWork = nil
+                }
+            } else if self.openedByHover {
+                // grace band below the panel so small overshoots don't collapse it
+                let stay = self.window.frame.insetBy(dx: -12, dy: -12)
+                if stay.contains(loc) {
+                    self.leaveWork?.cancel()
+                    self.leaveWork = nil
+                } else if self.leaveWork == nil {
+                    let work = DispatchWorkItem { [weak self] in
+                        guard let self else { return }
+                        self.leaveWork = nil
+                        guard self.expanded, self.openedByHover,
+                              !self.window.frame.insetBy(dx: -12, dy: -12).contains(NSEvent.mouseLocation)
+                        else { return }
+                        self.setExpanded(false)
+                    }
+                    self.leaveWork = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
+                }
+            }
+        }
+        NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved], handler: onMove)
+        // global monitors go quiet while our own panel has focus — mirror locally
+        NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved]) { e in onMove(e); return e }
         window.orderFrontRegardless()
         indicatorWindow.orderFrontRegardless()
 
@@ -1034,8 +1206,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Screen rect of the indicator — the only collapsed region that should catch clicks
-    private var indicatorScreenRect: NSRect {
+    /// The mascot zone alone. Clicks are matched against this, not the whole
+    /// pill: the status line can run far along the menu bar, and swallowing
+    /// clicks over another app's menus would be hostile.
+    private var indicatorClickRect: NSRect {
         NSRect(x: indicatorScreenX - 30, y: screen.frame.maxY - barHeight, width: 66, height: barHeight)
+    }
+
+    /// Mascot zone plus the status line — the window frame, and the hover target.
+    private var indicatorScreenRect: NSRect {
+        let extra = statusPixelWidth
+        return NSRect(x: indicatorScreenX - 30 - extra, y: screen.frame.maxY - barHeight,
+                      width: 66 + extra, height: barHeight)
     }
 
     private func setExpanded(_ on: Bool) {
@@ -1142,6 +1324,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             let result = self.scanner.scan(live: live, claudeCwdCounts: cwdCounts)
             DispatchQueue.main.async {
+                // Collapsed line: what's happening right now, sized before the
+                // indicator window frame is synced below (the pill grows with it)
+                let line = self.statusLine(for: result)
+                let liveCount = result.reduce(0) { $0 + ($1.anyLive ? 1 : 0) }
+                self.indicatorView.statusText = line
+                self.indicatorView.badgeCount = liveCount
+                self.statusPixelWidth = IndicatorView.statusWidth(text: line, badge: liveCount)
+
                 // Track fullscreen-space changes: full-width bar when the menu bar is hidden
                 if !self.expanded, !self.animating {
                     if self.window.frame != self.collapsedFrame() {
@@ -1172,6 +1362,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// One line describing the most interesting thing happening right now:
+    /// the busiest session's current tool call, else its prompt.
+    private func statusLine(for sessions: [AgentSession]) -> String {
+        let busy = sessions.filter { $0.anyBusy }
+        let pool = busy.isEmpty ? sessions.filter { $0.anyLive } : busy
+        guard let s = pool.max(by: { $0.effectiveLastModified < $1.effectiveLastModified }) else { return "" }
+        // a busy subagent is doing something more specific than its parent
+        let doer = s.children.first { $0.isBusy } ?? s
+        let text = !doer.activity.isEmpty ? doer.activity
+            : !s.prompt.isEmpty ? s.prompt
+            : s.title
+        return Self.ellipsize(text, max: 38)
+    }
+
+    private static func ellipsize(_ s: String, max n: Int) -> String {
+        let t = s.replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.count <= n ? t : String(t.prefix(n - 1)) + "…"
+    }
+
     private func tick() {
         frame += 1
         render()
@@ -1197,7 +1407,7 @@ if CommandLine.arguments.contains("--scan") {
     }
     print("== sessions ==")
     for s in SessionScanner().scan(live: live, claudeCwdCounts: cwdCounts) {
-        print("\(s.kind.rawValue) [\(s.title)] live=\(s.isLive) busy=\(s.isBusy) mtime=\(-s.lastModified.timeIntervalSinceNow)s kids=\(s.children.count)")
+        print("\(s.kind.rawValue) [\(s.title)] live=\(s.isLive) busy=\(s.isBusy) mtime=\(-s.lastModified.timeIntervalSinceNow)s kids=\(s.children.count) activity=\"\(s.activity)\"")
     }
     exit(0)
 }
