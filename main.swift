@@ -754,14 +754,20 @@ final class IndicatorView: NSView {
     static let statusFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
     static let badgeFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
 
-    /// Width the status line needs, so the window can size itself to fit.
-    static func statusWidth(text: String, badge: Int) -> CGFloat {
+    /// Where the physical notch sits inside this view, so content can be laid
+    /// out around it rather than underneath it.
+    var notchLeftInView: CGFloat = 0 { didSet { needsDisplay = true } }
+    var notchRightInView: CGFloat = 0 { didSet { needsDisplay = true } }
+
+    /// Width the status line needs, so the island can size itself to fit.
+    static func statusWidth(text: String) -> CGFloat {
         guard !text.isEmpty else { return 0 }
-        var w = (text as NSString).size(withAttributes: [.font: statusFont]).width + 8
-        if badge > 1 {
-            w += ("\(badge)" as NSString).size(withAttributes: [.font: badgeFont]).width + 10 + 8
-        }
-        return ceil(w)
+        return ceil((text as NSString).size(withAttributes: [.font: statusFont]).width + 8)
+    }
+
+    static func badgeWidth(_ count: Int) -> CGFloat {
+        guard count > 1 else { return 0 }
+        return ceil(("\(count)" as NSString).size(withAttributes: [.font: badgeFont]).width + 10)
     }
 
     static let claudeOrange = NSColor(red: 0.85, green: 0.47, blue: 0.34, alpha: 1)  // Anthropic coral
@@ -795,8 +801,13 @@ final class IndicatorView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        // Nothing to say: stay fully transparent rather than painting a black
+        // slab over the menu bar for no reason.
+        guard claudeState != .inactive || codexState != .inactive
+                || !statusText.isEmpty || badgeCount > 1 else { return }
+        drawIsland(ctx)
         let cy = bounds.midY
-        var x = bounds.maxX - 6  // right-aligned toward the notch
+        var x = notchLeftInView - 10  // content hugs the notch and grows outward
         // each agent keeps its own slot: mascot while running, green blob when
         // freshly done (cleared once you revisit the terminal)
         switch claudeState {
@@ -809,31 +820,50 @@ final class IndicatorView: NSView {
         case .done: drawGreenBlob(ctx, right: x, cy: cy); x -= 24
         case .inactive: break
         }
-        drawStatus(ctx, right: x, cy: cy)
+        drawStatus(right: x, cy: cy)
+        drawBadge(ctx, left: notchRightInView + 10, cy: cy)
     }
 
-    /// "Writing main.swift  ⟨3⟩" — laid out right-to-left from the mascots, so
-    /// the line grows leftward along the menu bar and never crosses the notch.
-    private func drawStatus(_ ctx: CGContext, right: CGFloat, cy: CGFloat) {
+    /// The black body, flush to the screen's top edge with rounded bottom
+    /// corners — same shape language as the open panel, so the island reads as
+    /// an extension of the hardware notch rather than a floating pill.
+    private func drawIsland(_ ctx: CGContext) {
+        let b = bounds, r: CGFloat = 11
+        let p = NSBezierPath()
+        p.move(to: NSPoint(x: b.minX, y: b.maxY))
+        p.line(to: NSPoint(x: b.minX, y: b.minY + r))
+        p.appendArc(withCenter: NSPoint(x: b.minX + r, y: b.minY + r), radius: r,
+                    startAngle: 180, endAngle: 270, clockwise: false)
+        p.line(to: NSPoint(x: b.maxX - r, y: b.minY))
+        p.appendArc(withCenter: NSPoint(x: b.maxX - r, y: b.minY + r), radius: r,
+                    startAngle: 270, endAngle: 0, clockwise: false)
+        p.line(to: NSPoint(x: b.maxX, y: b.maxY))
+        p.close()
+        NSColor.black.setFill()
+        p.fill()
+    }
+
+    /// Laid out right-to-left from the mascots, so the line grows leftward
+    /// along the menu bar and never crosses the notch.
+    private func drawStatus(right: CGFloat, cy: CGFloat) {
         guard !statusText.isEmpty else { return }
-        let attrs: [NSAttributedString.Key: Any] = [
+        let s = NSAttributedString(string: statusText, attributes: [
             .font: Self.statusFont,
             .foregroundColor: NSColor.white.withAlphaComponent(0.80),
-        ]
-        let s = NSAttributedString(string: statusText, attributes: attrs)
+        ])
         let size = s.size()
-        var x = right - 4 - size.width
-        s.draw(at: NSPoint(x: x, y: cy - size.height / 2))
+        s.draw(at: NSPoint(x: right - 4 - size.width, y: cy - size.height / 2))
+    }
 
+    /// Session count, on the far side of the notch.
+    private func drawBadge(_ ctx: CGContext, left: CGFloat, cy: CGFloat) {
         guard badgeCount > 1 else { return }
         let b = NSAttributedString(string: "\(badgeCount)", attributes: [
             .font: Self.badgeFont,
             .foregroundColor: NSColor.white.withAlphaComponent(0.72),
         ])
         let bsize = b.size()
-        let bw = bsize.width + 10, bh: CGFloat = 15
-        x -= 8 + bw
-        let rect = CGRect(x: x, y: cy - bh / 2, width: bw, height: bh)
+        let rect = CGRect(x: left, y: cy - 7.5, width: bsize.width + 10, height: 15)
         ctx.setFillColor(NSColor.white.withAlphaComponent(0.14).cgColor)
         ctx.addPath(CGPath(roundedRect: rect, cornerWidth: 4, cornerHeight: 4, transform: nil))
         ctx.fillPath()
@@ -1054,13 +1084,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return NSRect(x: s.minX, y: s.maxY - barHeight, width: s.width, height: barHeight)
     }
 
-    /// Fixed spot just left of the notch.
-    private var indicatorScreenX: CGFloat {
-        let s = screen
-        var notchLeftX = s.frame.midX - 90
-        if #available(macOS 12.0, *), let left = s.auxiliaryTopLeftArea { notchLeftX = left.maxX }
-        return notchLeftX - 36
-    }
     private func expandedFrame() -> NSRect {
         let s = screen.frame
         let w = max(expandedSize.width, notchWidth + sidePad * 2)
@@ -1206,19 +1229,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Screen rect of the indicator — the only collapsed region that should catch clicks
-    /// The mascot zone alone. Clicks are matched against this, not the whole
-    /// pill: the status line can run far along the menu bar, and swallowing
-    /// clicks over another app's menus would be hostile.
-    private var indicatorClickRect: NSRect {
-        NSRect(x: indicatorScreenX - 30, y: screen.frame.maxY - barHeight, width: 66, height: barHeight)
+    /// Screen X of the physical notch's edges (a virtual one when there's no notch).
+    private var notchLeftX: CGFloat {
+        let s = screen
+        if #available(macOS 12.0, *), s.safeAreaInsets.top > 0, let left = s.auxiliaryTopLeftArea {
+            return left.maxX
+        }
+        return s.frame.midX - notchWidth / 2
+    }
+    private var notchRightX: CGFloat {
+        let s = screen
+        if #available(macOS 12.0, *), s.safeAreaInsets.top > 0, let right = s.auxiliaryTopRightArea {
+            return right.minX
+        }
+        return s.frame.midX + notchWidth / 2
     }
 
-    /// Mascot zone plus the status line — the window frame, and the hover target.
-    private var indicatorScreenRect: NSRect {
-        let extra = statusPixelWidth
-        return NSRect(x: indicatorScreenX - 30 - extra, y: screen.frame.maxY - barHeight,
-                      width: 66 + extra, height: barHeight)
+    /// Width the mascots need, left of the notch.
+    private var glyphZoneWidth: CGFloat {
+        var w: CGFloat = 0
+        if claudeState != .inactive { w += 30 }
+        if codexState != .inactive { w += 30 }
+        return w
     }
+
+    /// The island: black, flush to the top edge, growing sideways out of the
+    /// real notch so the two read as one shape. Mascots and the status line
+    /// live to its left, the session badge to its right.
+    private var indicatorScreenRect: NSRect {
+        let leftContent = glyphZoneWidth + statusPixelWidth
+        let rightContent = IndicatorView.badgeWidth(indicatorView.badgeCount)
+        let x0 = notchLeftX - leftContent - (leftContent > 0 ? 14 : 0)
+        let x1 = notchRightX + rightContent + (rightContent > 0 ? 14 : 0)
+        return NSRect(x: x0, y: screen.frame.maxY - barHeight, width: x1 - x0, height: barHeight)
+    }
+
+    /// The island is visible, so clicking anywhere on it is unambiguous.
+    private var indicatorClickRect: NSRect { indicatorScreenRect }
 
     private func setExpanded(_ on: Bool) {
         guard expanded != on else { return }
@@ -1330,16 +1377,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let liveCount = result.reduce(0) { $0 + ($1.anyLive ? 1 : 0) }
                 self.indicatorView.statusText = line
                 self.indicatorView.badgeCount = liveCount
-                self.statusPixelWidth = IndicatorView.statusWidth(text: line, badge: liveCount)
+                self.statusPixelWidth = IndicatorView.statusWidth(text: line)
 
                 // Track fullscreen-space changes: full-width bar when the menu bar is hidden
                 if !self.expanded, !self.animating {
                     if self.window.frame != self.collapsedFrame() {
                         self.window.setFrame(self.collapsedFrame(), display: true)
                     }
-                    // re-dodge menu items as the frontmost app changes
-                    let r = self.indicatorScreenRect
-                    if self.indicatorWindow.frame != r { self.indicatorWindow.setFrame(r, display: true) }
                 }
                 IndicatorView.refreshPetChoice()
                 self.listController.sessions = result
@@ -1391,7 +1435,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         indicatorView.claudeState = claudeState
         indicatorView.codexState = codexState
         indicatorView.t = CGFloat(frame) * 0.12
+        // The island is sized from the glyph states set just above, so resize
+        // here rather than in rescan(), and tell the view where the notch is.
+        guard !expanded, !animating else { return }
+        let r = indicatorScreenRect
+        if indicatorWindow.frame != r { indicatorWindow.setFrame(r, display: true) }
+        indicatorView.notchLeftInView = notchLeftX - r.minX
+        indicatorView.notchRightInView = notchRightX - r.minX
     }
+}
+
+// Debug: `./AgentNotch --geometry` prints the notch/island math and exits.
+if CommandLine.arguments.contains("--geometry") {
+    let s = NSScreen.screens.first { $0.frame.origin == .zero } ?? NSScreen.main!
+    print("screen      = \(s.frame)")
+    if #available(macOS 12.0, *) {
+        print("safeAreaTop = \(s.safeAreaInsets.top)")
+        print("auxLeft     = \(s.auxiliaryTopLeftArea.map { "\($0)" } ?? "nil")")
+        print("auxRight    = \(s.auxiliaryTopRightArea.map { "\($0)" } ?? "nil")")
+        if let l = s.auxiliaryTopLeftArea, let r = s.auxiliaryTopRightArea {
+            print("notch       = x \(l.maxX) … \(r.minX)  (width \(r.minX - l.maxX))")
+        }
+    }
+    exit(0)
 }
 
 // Debug: `./AgentNotch --scan` prints one discovery + scan cycle and exits.
